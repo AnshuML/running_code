@@ -1818,19 +1818,36 @@ def predict():
         if wpi_best:
             top_results = [wpi_best] + [r for r in top_results if r["parent"] != wpi_best["parent"]][:2]
 
-    # Prioritize dataset to 1st when user searched by dataset name (wpi, plfs, ec, nss, cpi, etc.)
+    # Prioritize dataset to 1st when user searched by dataset name - all 23 datasets, 95% confidence
     _raw_lower = raw_q.lower().strip()
     _ds_priority = None
-    if re.search(r'\bwpi\b', _raw_lower) or ("wholesale" in _raw_lower and "price" in _raw_lower):
+    # Specific codes first (nss77 before nss, ec4 before ec, etc.)
+    if re.search(r'\bnss77\b', _raw_lower):
+        _ds_priority = ["NSS77"]
+    elif re.search(r'\bnss78\b', _raw_lower):
+        _ds_priority = ["NSS78"]
+    elif re.search(r'\bnss79\b', _raw_lower) or re.search(r'\bnss79c\b', _raw_lower):
+        _ds_priority = ["NSS79C"]
+    elif re.search(r'\bec4\b', _raw_lower):
+        _ds_priority = ["EC4"]
+    elif re.search(r'\bec5\b', _raw_lower):
+        _ds_priority = ["EC5"]
+    elif re.search(r'\bec6\b', _raw_lower):
+        _ds_priority = ["EC6"]
+    elif re.search(r'\bcpi2\b', _raw_lower):
+        _ds_priority = ["CPI2"]
+    elif re.search(r'\bwpi\b', _raw_lower) or ("wholesale" in _raw_lower and "price" in _raw_lower):
         _ds_priority = ["WPI"]
     elif re.search(r'\bplfs\b', _raw_lower):
         _ds_priority = ["PLFS"]
     elif re.search(r'\bec\b', _raw_lower) or ("economic" in _raw_lower and "census" in _raw_lower):
         _ds_priority = ["EC4", "EC5", "EC6"]
     elif re.search(r'\bnss\b', _raw_lower):
-        _ds_priority = ["NSS77", "NSS78"]
+        _ds_priority = ["NSS77", "NSS78", "NSS79C"]
     elif re.search(r'\bcpi\b', _raw_lower):
         _ds_priority = ["CPI", "CPI2"]
+    elif re.search(r'\bcpialrl\b', _raw_lower) or ("consumer price" in _raw_lower and "agricultural" in _raw_lower):
+        _ds_priority = ["CPIALRL"]
     elif re.search(r'\bnas\b', _raw_lower):
         _ds_priority = ["NAS"]
     elif re.search(r'\basi\b', _raw_lower):
@@ -1839,10 +1856,25 @@ def predict():
         _ds_priority = ["HCES"]
     elif re.search(r'\biip\b', _raw_lower):
         _ds_priority = ["IIP"]
+    elif re.search(r'\brbi\b', _raw_lower):
+        _ds_priority = ["RBI"]
+    elif re.search(r'\baishe\b', _raw_lower) or ("higher education" in _raw_lower and "survey" in _raw_lower):
+        _ds_priority = ["AISHE"]
+    elif re.search(r'\bnfhs\b', _raw_lower) or ("family health" in _raw_lower and "survey" in _raw_lower):
+        _ds_priority = ["NFHS"]
+    elif re.search(r'\btus\b', _raw_lower) or ("time use" in _raw_lower and "survey" in _raw_lower):
+        _ds_priority = ["TUS"]
+    elif re.search(r'\besi\b', _raw_lower) or ("employment" in _raw_lower and "survey" in _raw_lower and "establishment" in _raw_lower):
+        _ds_priority = ["ESI"]
+    elif re.search(r'\benvstat\b', _raw_lower) or ("environment" in _raw_lower and "statistic" in _raw_lower):
+        _ds_priority = ["ENVSTAT"]
+    elif re.search(r'\basuse\b', _raw_lower):
+        _ds_priority = ["ASUSE"]
     if _ds_priority:
         for i, r in enumerate(top_results):
             if r["parent"] in _ds_priority and i > 0:
                 top_results = [r] + [x for x in top_results if x["parent"] != r["parent"]][:2]
+                r["score"] = max(x["score"] for x in top_results) + 1  # 95% confidence for 1st
                 break
 
     confidences = normalize_confidence([r["score"] for r in top_results])
