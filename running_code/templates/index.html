@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Semantic Search Test UI</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 24px;
+            background: #0f1419;
+            color: #e6edf3;
+            min-height: 100vh;
+        }
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #8b949e;
+            font-size: 0.9rem;
+            margin-bottom: 24px;
+        }
+        .search-box {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 16px;
+            font-size: 1rem;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            background: #21262d;
+            color: #e6edf3;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+        button {
+            padding: 12px 20px;
+            font-size: 1rem;
+            font-weight: 500;
+            background: #238636;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        button:hover { background: #2ea043; }
+        button:disabled {
+            background: #30363d;
+            color: #8b949e;
+            cursor: not-allowed;
+        }
+        .quick-tests {
+            margin-bottom: 24px;
+        }
+        .quick-tests h3 {
+            font-size: 0.85rem;
+            color: #8b949e;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        .quick-tests button {
+            background: #21262d;
+            color: #58a6ff;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            padding: 8px 14px;
+            font-size: 0.9rem;
+        }
+        .quick-tests button:hover { background: #30363d; }
+        .quick-tests .nss { border-left: 3px solid #f0883e; }
+        .rewritten {
+            padding: 12px;
+            background: #161b22;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+        }
+        .rewritten strong { color: #58a6ff; }
+        .results {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .result-card {
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            padding: 18px;
+        }
+        .result-card.nss77, .result-card.nss78 {
+            border-left: 4px solid #f0883e;
+        }
+        .dataset {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #58a6ff;
+            margin-bottom: 6px;
+        }
+        .indicator {
+            color: #c9d1d9;
+            font-size: 0.95rem;
+            margin-bottom: 12px;
+        }
+        .confidence {
+            font-size: 0.8rem;
+            color: #8b949e;
+            margin-bottom: 12px;
+        }
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .filter-tag {
+            background: #161b22;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            color: #8b949e;
+        }
+        .filter-tag .name { color: #58a6ff; }
+        .no-year {
+            background: #238636;
+            color: white;
+        }
+        .error {
+            background: #da3633;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .loading {
+            color: #8b949e;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Semantic Search Test UI</h1>
+    <p class="subtitle">Test karke verify karein: NSS77 aur NSS78 ke results mein Year filter nahi aana chahiye</p>
+
+    <div class="search-box">
+        <input type="text" id="query" placeholder="Query likho, e.g. NSS78 drinking water rural..." autofocus>
+        <button id="search">Search</button>
+    </div>
+
+    <div class="quick-tests">
+        <h3>Quick Test (NSS77 / NSS78 - Year nahi aana chahiye)</h3>
+        <button class="nss" data-q="NSS78 drinking water">NSS78 Drinking Water</button>
+        <button class="nss" data-q="NSS78 household amenities">NSS78 Household Amenities</button>
+        <button class="nss" data-q="NSS77 land possessed">NSS77 Land Possessed</button>
+        <button class="nss" data-q="NSS77 agricultural households">NSS77 Agricultural Households</button>
+        <button class="nss" data-q="NSS78 migration">NSS78 Migration</button>
+    </div>
+
+    <div id="rewritten" class="rewritten" style="display:none;"></div>
+    <div id="error" class="error" style="display:none;"></div>
+    <div id="results" class="results"></div>
+
+    <script>
+        const queryEl = document.getElementById('query');
+        const searchBtn = document.getElementById('search');
+        const resultsEl = document.getElementById('results');
+        const rewrittenEl = document.getElementById('rewritten');
+        const errorEl = document.getElementById('error');
+
+        async function search() {
+            const q = queryEl.value.trim();
+            if (!q) return;
+
+            errorEl.style.display = 'none';
+            resultsEl.innerHTML = '<div class="loading">Searching...</div>';
+            rewrittenEl.style.display = 'none';
+            searchBtn.disabled = true;
+
+            try {
+                const res = await fetch('/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: q })
+                });
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.error || 'Request failed');
+                }
+
+                if (data.rewritten_query) {
+                    rewrittenEl.innerHTML = '<strong>LLM Rewritten:</strong> ' + data.rewritten_query;
+                    rewrittenEl.style.display = 'block';
+                }
+
+                if (!data.results || data.results.length === 0) {
+                    resultsEl.innerHTML = '<div class="loading">No results found</div>';
+                    return;
+                }
+
+                resultsEl.innerHTML = data.results.map(r => {
+                    const isNSS77 = (r.dataset || '').toUpperCase() === 'NSS77';
+                    const isNSS78 = (r.dataset || '').toUpperCase() === 'NSS78';
+                    const hasYear = (r.filters || []).some(f => (f.filter_name || '').toLowerCase().includes('year'));
+                    const cls = isNSS77 ? 'nss77' : isNSS78 ? 'nss78' : '';
+
+                    const filterTags = (r.filters || []).map(f => {
+                        const isYearFilter = (f.filter_name || '').toLowerCase().includes('year');
+                        const tagCls = isNSS77 || isNSS78 ? (isYearFilter ? 'no-year' : '') : '';
+                        return `<span class="filter-tag ${tagCls}"><span class="name">${escapeHtml(f.filter_name)}:</span> ${escapeHtml(String(f.option))}</span>`;
+                    }).join('');
+
+                    let yearNote = '';
+                    if ((isNSS77 || isNSS78) && hasYear) {
+                        yearNote = '<div class="filter-tag no-year" style="margin-top:8px">&#9888; Year filter mila - fix required</div>';
+                    } else if (isNSS77 || isNSS78) {
+                        yearNote = '<div class="filter-tag no-year" style="margin-top:8px">&#9989; Year filter nahi hai (correct)</div>';
+                    }
+
+                    return `
+                        <div class="result-card ${cls}">
+                            <div class="dataset">${escapeHtml(r.dataset)}</div>
+                            <div class="indicator">${escapeHtml(r.indicator)}</div>
+                            <div class="confidence">Confidence: ${r.confidence}%</div>
+                            <div class="filters">${filterTags}</div>
+                            ${yearNote}
+                        </div>
+                    `;
+                }).join('');
+
+            } catch (err) {
+                errorEl.textContent = err.message || 'Error occurred';
+                errorEl.style.display = 'block';
+                resultsEl.innerHTML = '';
+            } finally {
+                searchBtn.disabled = false;
+            }
+        }
+
+        function escapeHtml(s) {
+            const div = document.createElement('div');
+            div.textContent = s;
+            return div.innerHTML;
+        }
+
+        searchBtn.addEventListener('click', search);
+        queryEl.addEventListener('keypress', e => { if (e.key === 'Enter') search(); });
+
+        document.querySelectorAll('.quick-tests button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                queryEl.value = btn.dataset.q;
+                search();
+            });
+        });
+    </script>
+</body>
+</html>
