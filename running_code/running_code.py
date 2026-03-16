@@ -1219,11 +1219,13 @@ YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
 # HELPERS
 # ================================
 def clean_text(t):
+    """Text ko lowercase karke special chars hatao, sirf a-z 0-9 space rakho. Embedding/search ke liye normalize."""
     t = (t or "").lower()
     t = re.sub(r"[^a-z0-9\s]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 def normalize_confidence(scores, min_conf=50, max_conf=95):
+    """Scores ko min_conf se max_conf range mein scale karo. Sab indicators ko 50-95% confidence range mein map."""
     if not scores:
         return []
     mn, mx = min(scores), max(scores)
@@ -1237,6 +1239,7 @@ def normalize_confidence(scores, min_conf=50, max_conf=95):
 BASE_YEAR_PATTERN = re.compile(r"(20\d{2})")
 
 def detect_base_year(query):
+    """Query mein base year (20xx) detect karo. CPI/CPI2 conflict resolve ke liye use hota hai."""
     q = query.lower()
 
     if "base year" or " base" in q:
@@ -1248,9 +1251,8 @@ def detect_base_year(query):
 
 
 def resolve_cpi_conflict(results, query):
-    """
-    Only when CPI and CPI2 both present in top results
-    """
+    """Jab CPI aur CPI2 dono top results mein hon: base year 2024+ → CPI2 rakho, else CPI rakho. Default: CPI2."""
+    # Only when CPI and CPI2 both present in top results
     datasets = [r["parent"] for r in results]
 
     if "CPI" not in datasets or "CPI2" not in datasets:
@@ -1275,6 +1277,7 @@ def resolve_cpi_conflict(results, query):
 # LLM QUERY REWRITE
 # ================================
 def rewrite_query_with_llm(user_query):
+    """Ollama LLM se query normalize/rewrite karo (spelling, synonyms, dataset full form). Fail → raw query return."""
     prompt =  f"""
 You are a QUERY NORMALIZATION ENGINE for a data analytics system.
 
@@ -1382,10 +1385,12 @@ User Query:
 # YEAR NORMALIZATION
 # ================================
 def normalize_year_string(s):
+    """String se sirf digits nikalo (e.g. '2023-24' → '202324'). Year matching ke liye."""
     return re.sub(r"[^0-9]", "", str(s))
 
 
 def map_year_to_option(user_year, options):
+    """User year (e.g. 2023) ko options (2023-24, 2022-23, etc.) mein map karo. Match nahi → None."""
     y = int(user_year)
     targets = [
          f"{y}{y+1}",            # → "20232024"
@@ -1401,9 +1406,129 @@ def map_year_to_option(user_year, options):
     return None
 
 # ================================
+# FILTER ACCURACY & ESSENTIAL FILTERS (Moth criteria)
+# Filter Accuracy = 4 filters only: Year, Sector, Gender, State (when present, must appear first)
+# Essential Filters Accuracy = CPI: Series, Base Year; IIP: Base Year; ASI: Classification Year;
+#                             NAS: Series, Frequency; CPIALRL: Base Year (when present, must appear)
+# ================================
+# 4 filters - Filter Accuracy basis
+MANDATORY_4 = ["Year", "Sector", "Gender", "State"]
+
+# Essential filters per dataset - Essential Filters Accuracy basis
+ESSENTIAL_FILTERS_BY_DATASET = {
+    "CPI": ["Series", "Base_Year"],
+    "IIP": ["Base_Year"],
+    "ASI": ["classification_year"],
+    "NAS": ["Series", "Frequency"],
+    "CPIALRL": ["Base_Year"],
+}
+
+
+def _priority_order_for_dataset(parent_code):
+    """Filter ka priority order banao: Year,Sector,Gender,State pehle, phir dataset essential (Series,Base_Year,etc.), phir rest."""
+    order = ["Year", "financial_Year", "Sector", "Gender", "State"]
+    essential = ESSENTIAL_FILTERS_BY_DATASET.get(parent_code, [])
+    for e in essential:
+        if e not in order:
+            order.append(e)
+    for k in ["Base_Year", "Series", "classification_year", "Frequency"]:
+        if k not in order:
+            order.append(k)
+    return order
+
+
+def ensure_mandatory_filter_order(best_filters, parent_code):
+    """best_filters ko Moth criteria ke hisaab se reorder: 4 filters first, phir essential, phir baaki. Sirf reorder, kuch add/remove nahi."""
+    if not best_filters:
+        return best_filters
+    by_name = {f["filter_name"]: f for f in best_filters}
+    ordered = []
+    priority = _priority_order_for_dataset(parent_code)
+    for key in priority:
+        if key in by_name:
+            ordered.append(by_name.pop(key))
+    for f in best_filters:
+        if f["filter_name"] in by_name:
+            ordered.append(by_name.pop(f["filter_name"]))
+    for v in by_name.values():
+        ordered.append(v)
+    return ordered
+
+
+def ensure_required_filters_present(best_filters, parent_code, grouped, query, cross_encoder):
+    """Jo required filters (4 + essential) grouped mein hain lekin best_filters mein nahi, unko add karo. Phir sahi order apply karo."""
+    required = list(MANDATORY_4)
+    required.extend(ESSENTIAL_FILTERS_BY_DATASET.get(parent_code, []))
+    required = list(dict.fromkeys(required))
+    out_names = {f["filter_name"]: f for f in best_filters}
+    for r in required:
+        if r in out_names:
+            continue
+        if r not in grouped:
+            continue
+        opts = grouped[r]
+        if not opts:
+            continue
+        best_opt = select_best_filter_option(query, r, opts, cross_encoder)
+        best_filters.append({"filter_name": r, "option": best_opt["option"]})
+        out_names[r] = best_filters[-1]
+    best_filters = ensure_mandatory_filter_order(best_filters, parent_code)
+    # Golden rule: CPI-only. Series+Base_Year valid combos: (Current,2012), (Back,2010)
+    best_filters = ensure_cpi_series_base_year_consistent(best_filters, parent_code, grouped, query)
+    return best_filters
+
+
+def ensure_cpi_series_base_year_consistent(best_filters, parent_code, grouped, query):
+    """CPI/CPI2 ke liye Series+Base_Year valid combo ensure karo: Current↔2012, Back↔2010. Mismatch ho to fix. Baaki datasets pe no-op."""
+    if parent_code not in ("CPI", "CPI2"):
+        return best_filters
+    by_name = {f["filter_name"]: f for f in best_filters}
+    if "Series" not in by_name or "Base_Year" not in by_name:
+        return best_filters
+    q_lower = query.lower()
+    series_opt = str(by_name["Series"].get("option", "")).lower()
+    base_opt = str(by_name["Base_Year"].get("option", "")).lower()
+    base_year = re.search(r"20\d{2}", base_opt)
+    base_year = base_year.group(0) if base_year else ""
+    target_series, target_base = None, None
+    if "back" in q_lower or "2010" in q_lower:
+        target_series, target_base = "Back", "2010"
+    elif "current" in q_lower or "2012" in q_lower:
+        target_series, target_base = "Current", "2012"
+    elif series_opt == "back" and base_year and base_year != "2010":
+        target_series, target_base = "Back", "2010"
+    elif series_opt == "current" and base_year and base_year != "2012":
+        target_series, target_base = "Current", "2012"
+    elif base_year == "2010" and series_opt != "back":
+        target_series, target_base = "Back", "2010"
+    elif base_year == "2012" and series_opt != "current":
+        target_series, target_base = "Current", "2012"
+    elif not base_year and series_opt == "current":
+        target_base = "2012"
+    elif not base_year and series_opt == "back":
+        target_base = "2010"
+    if not target_series and not target_base:
+        return best_filters
+    series_opts = grouped.get("Series", [])
+    base_opts = grouped.get("Base_Year", [])
+    if target_series:
+        for opt in series_opts:
+            if str(opt.get("option", "")).lower() == target_series.lower():
+                by_name["Series"]["option"] = opt["option"]
+                break
+    if target_base:
+        for opt in base_opts:
+            if target_base in str(opt.get("option", "")):
+                by_name["Base_Year"]["option"] = opt["option"]
+                break
+    return best_filters
+
+
+# ================================
 # UNIVERSAL FILTER NORMALIZER
 # ================================
 def universal_filter_normalizer(ind_code, filters_json):
+    """products.json ke nested filters ko flat list mein convert karo: [{parent, filter_name, option}, ...]. Nested dict/list recurse karta hai."""
     flat = []
     def recurse(key, value):
         if isinstance(value, list) and all(isinstance(x, str) for x in value):
@@ -1432,6 +1557,9 @@ def universal_filter_normalizer(ind_code, filters_json):
 # SMART FILTER ENGINE
 # ================================
 def select_best_filter_option(query, filter_name, options, cross_encoder):
+    """Query ke hisaab se sabse sahi filter option pick karo. Year→Select All/latest, Series→Current/Back, State/Sector→match, etc."""
+    if not options:
+        return {"parent": "", "filter_name": filter_name, "option": "Select All"}
     q_lower = query.lower()
     fname_lower = filter_name.lower()
      
@@ -1443,7 +1571,8 @@ def select_best_filter_option(query, filter_name, options, cross_encoder):
         for keyword in ["annually", "quarterly", "monthly", "annual"]:
             if keyword in q_lower:
                 for opt in options:
-                    if opt["option"].lower().startswith(keyword) or keyword.startswith(opt["option"].lower()):
+                    o = str(opt.get("option", "")).lower()
+                    if o.startswith(keyword) or keyword.startswith(o):
                         return opt
 
         # --- Month names → Monthly (full names only to avoid "may" false positive) ---
@@ -1453,7 +1582,8 @@ def select_best_filter_option(query, filter_name, options, cross_encoder):
         ]
         if any(m in q_lower for m in month_names):
             for opt in options:
-                if opt["option"].lower() in ["monthly", "month"]:
+                o = str(opt.get("option", "")).lower()
+                if o in ["monthly", "month"]:
                     return opt
 
         # --- Quarter keywords → Quarterly ---
@@ -1461,53 +1591,13 @@ def select_best_filter_option(query, filter_name, options, cross_encoder):
                             "jul-sep", "oct-dec", "jan-mar", "apr-jun"]
         if any(qk in q_lower for qk in quarter_keywords):
             for opt in options:
-                if opt["option"].lower() in ["quarterly"]:
+                if str(opt.get("option", "")).lower() in ["quarterly"]:
                     return opt
 
         # --- Year format "2023-24" or standalone year → Annually ---
         if re.search(r"\d{4}[-/]\d{2,4}", q_lower) or YEAR_PATTERN.search(q_lower):
             for opt in options:
-                if opt["option"].lower() in ["annually", "annual"]:
-                    return opt
-
-        # --- No frequency clue → Select All ---
-        return {
-            "parent": options[0]["parent"],
-            "filter_name": filter_name,
-            "option": "Select All"
-        }
-    # FREQUENCY FILTER
-    # =========================
-    if fname_lower in ["frequency"]:
-        # --- Check for explicit mention ---
-        for keyword in ["annually", "annual", "quarterly", "monthly"]:
-            if keyword in q_lower:
-                for opt in options:
-                    if opt["option"].lower().startswith(keyword) or keyword.startswith(opt["option"].lower()):
-                        return opt
-
-        # --- Month names → Monthly (no "may" — too common in English) ---
-        month_names = [
-            "january", "february", "march", "april", "june",
-            "july", "august", "september", "october", "november", "december"
-        ]
-        if any(m in q_lower for m in month_names):
-            for opt in options:
-                if opt["option"].lower() in ["monthly", "month"]:
-                    return opt
-
-        # --- Quarter keywords → Quarterly ---
-        quarter_keywords = ["quarter", "quarterly", "q1", "q2", "q3", "q4",
-                            "jul-sep", "oct-dec", "jan-mar", "apr-jun"]
-        if any(qk in q_lower for qk in quarter_keywords):
-            for opt in options:
-                if opt["option"].lower() in ["quarterly"]:
-                    return opt
-
-        # --- Year format "2023-24" or standalone year → Annually ---
-        if re.search(r"\d{4}[-/]\d{2,4}", q_lower) or YEAR_PATTERN.search(q_lower):
-            for opt in options:
-                if opt["option"].lower() in ["annually", "annual"]:
+                if str(opt.get("option", "")).lower() in ["annually", "annual"]:
                     return opt
 
         # --- No frequency clue → Select All ---
@@ -1517,21 +1607,26 @@ def select_best_filter_option(query, filter_name, options, cross_encoder):
             "option": "Select All"
         }
     # =========================
-    # YEAR FILTER
+    # YEAR FILTER (Year, financial_Year)
+    # User mention nahi kiya → Select All (agar hai), else latest year
+    # User mention kiya → exact year
     # =========================
     if "year" in fname_lower and "base" not in fname_lower:
         year_match = YEAR_PATTERN.search(q_lower)
 
-        # user ne year nahi bola → Select All
         if not year_match:
-            return {
-                "parent": options[0]["parent"],
-                "filter_name": filter_name,
-                "option": "Select All"
-            }
+            # User ne year nahi bola → Select All agar options mein hai, else latest year
+            for opt in options:
+                o = str(opt.get("option", "")).strip().lower()
+                if o in ("select all", "selectall"):
+                    return opt
+            # Select All nahi hai → latest/current year return karo
+            def _extract_year_val(o):
+                m = re.search(r"20\d{2}", str(o.get("option", "")))
+                return int(m.group(0)) if m else 0
+            return max(options, key=lambda o: _extract_year_val(o))
 
         user_year = year_match.group(1)
-
         mapped = map_year_to_option(user_year, options)
         if mapped:
             return mapped
@@ -1541,19 +1636,49 @@ def select_best_filter_option(query, filter_name, options, cross_encoder):
         return options[int(np.argmax(scores))]
 
     # =========================
+    # SERIES FILTER (CPI, NAS - Current/Back)
+    # =========================
+    if fname_lower == "series":
+        if "back" in q_lower or "historical" in q_lower:
+            for opt in options:
+                if str(opt.get("option", "")).lower() == "back":
+                    return opt
+        if "current" in q_lower:
+            for opt in options:
+                if str(opt.get("option", "")).lower() == "current":
+                    return opt
+        for opt in options:
+            if str(opt.get("option", "")).lower() == "current":
+                return opt
+        return options[0] if options else {"parent": "", "filter_name": filter_name, "option": "Select All"}
+
+    # =========================
+    # CLASSIFICATION YEAR (ASI)
+    # =========================
+    if fname_lower == "classification_year":
+        for opt in options:
+            opt_text = str(opt.get("option", "")).lower()
+            if opt_text in q_lower:
+                return opt
+        def _extract_year(opt):
+            m = re.search(r"\d{4}", str(opt.get("option", "")))
+            return int(m.group(0)) if m else 0
+        return max(options, key=lambda o: _extract_year(o))
+
+    # =========================
     # BASE YEAR FILTER (FINAL FIX)
     # =========================
     if "base" in fname_lower and "year" in fname_lower:
 
         # 🔹 check if user explicitly mentioned base year
         for opt in options:
-            opt_text = str(opt["option"]).lower()
+            opt_text = str(opt.get("option", "")).lower()
             if opt_text in q_lower:
                 return opt
 
         # 🔹 user ne base year nahi bola → latest base year pick karo
         def extract_start_year(opt):
-            m = re.search(r"\d{4}", str(opt["option"]))
+            m = re.search(r"\d{4}", str(opt.get("option", "")))
             return int(m.group(0)) if m else 0
 
         latest = max(options, key=lambda o: extract_start_year(o))
@@ -1689,6 +1814,7 @@ else:
 # SEARCH
 # ================================
 def search_indicators(query, top_k=25, max_products=3):
+    """Query ke hisaab se semantic search karo (Qdrant/FAISS). Cross-encoder rerank, CPI conflict resolve. Har dataset se max 1 indicator. Top max_products return."""
     q_vec = bi_encoder.encode([clean_text(query)], convert_to_numpy=True)
     q_vec /= np.linalg.norm(q_vec, axis=1, keepdims=True)
 
@@ -1722,7 +1848,7 @@ def search_indicators(query, top_k=25, max_products=3):
 
 
 def _search_dataset_only(query, parent_codes):
-    """Search only within given dataset parent codes. Returns best match or None."""
+    """Sirf given dataset(s) ke indicators mein search karo. Best matching indicator return, nahi mile to None."""
     if isinstance(parent_codes, str):
         parent_codes = (parent_codes,)
     indicators = [i.copy() for i in INDICATORS if i["parent"] in parent_codes]
@@ -1736,10 +1862,12 @@ def _search_dataset_only(query, parent_codes):
 
 
 def _search_wpi_only(query):
+    """WPI dataset ke andar sirf search karo. Force-include ke liye use hota hai."""
     return _search_dataset_only(query, "WPI")
 
 
 def _search_ec_only(query):
+    """EC4/EC5/EC6 ke andar search karo. Economic Census force-include ke liye."""
     return _search_dataset_only(query, ("EC4", "EC5", "EC6"))
 
 
@@ -1752,6 +1880,7 @@ from datetime import datetime
 LOG_FILE = os.path.join(BASE_DIR, "logs", "queries.jsonl")
 
 def save_query_log(raw_query, rewritten_query, response_json):
+    """Har search request ko logs/queries.jsonl mein append karo (raw query, rewritten, response). Debug/analytics ke liye."""
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
     record = {
@@ -1774,10 +1903,12 @@ CORS(app)
 
 @app.route("/")
 def home():
+    """Home page - search UI render karo."""
     return render_template("index.html")
 
 @app.route("/search/predict", methods=["POST"])
 def predict():
+    """Main API: query receive karo, LLM rewrite, semantic search, filter selection, results + filters return. Top 3 datasets."""
     raw_q = request.json.get("query", "").strip()
     if not raw_q:
         return jsonify({"error": "query required"}), 400
@@ -1935,6 +2066,8 @@ def predict():
                 "filter_name": fname,
                 "option": best_opt["option"]
             })
+        # Filter Accuracy (4) + Essential (CPI/IIP/ASI/NAS/CPIALRL): ensure present & order
+        best_filters = ensure_required_filters_present(best_filters, ind["parent"], grouped, q, cross_encoder)
 
         results.append({
             "dataset": dataset["name"],
