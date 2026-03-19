@@ -1,0 +1,68 @@
+---
+description: e-Sankhyiki project conventions, golden rule, and essential criteria
+globs: running_code/**/*.py, running_code/**/products.json
+alwaysApply: true
+---
+
+# e-Sankhyiki Project Rules
+
+## File Creation
+
+**Unnecessary files create nahi karna.** Sirf zaroori files hi banao. Extra .md, .txt, test scripts, etc. bina request ke mat banao.
+
+## Golden Rule
+
+**All changes must be narrow scope:**
+- Dataset-specific or filter-type-specific only
+- Baaki datasets ka logic same rehna chahiye
+- When adding logic for one dataset (e.g. CPI), guard with `if parent_code not in ("CPI", "CPI2"): return` so other datasets are unaffected
+
+## Moth Criteria
+
+### Filter Accuracy (4 filters)
+Year, Sector, Gender, State — jab present hon, pehle aane chahiye.
+
+### Essential Filters Accuracy (per dataset)
+| Dataset | Essential Filters |
+|---------|-------------------|
+| CPI | Series, Base_Year |
+| IIP | Base_Year |
+| ASI | classification_year |
+| NAS | Series, Frequency |
+| CPIALRL | Base_Year |
+
+## CPI Series + Base_Year
+
+Valid combos only: `Current↔2012`, `Back↔2010`. Fix permutation if mismatch.
+
+## Dataset + Indicator + Filters + Essential Filters — Max Data for User
+
+**Goal:** User ko dropdown mein maximum possible data provide karo. Exact data fill hoke mile.
+
+### Case 1: User sirf dataset naam search kare (e.g. "plfs", "CPI")
+
+- **ALL indicators** select kar sakta ho
+- **Year filter:**
+  - User ne mention nahi kiya → **Select All** (agar options mein hai), else **latest/current year**
+  - User ne mention kiya → **exact year**
+  - Agar dataset mein "Select All" nahi hai → **latest year** return karo
+- State, Sector, Gender, etc. → **Select All** (jab user ne specific na bola ho)
+- Series, Base_Year (CPI) → Current + 2012 default
+- URL format: `?product=plfs&indicator=...&year=Select+All&state=Select+All&gender=Select+All&sector=Select+All&...&isSemantic=1`
+- Example: [PLFS macroindicators URL](https://esankhyiki.mospi.gov.in/macroindicators?product=plfs&indicator=LFPR+%28Labour+Force+Participation+Rate%2C+in+per+cent%29&year=Select+All&frequency=Select+All&state=Select+All&gender=Select+All&sector=Select+All&age+group=Select+All&weekly+status=Select+All&religion=Select+All&social+category=Select+All&general+education=Select+All&broad+status+employment=Select+All&broad+industry+work=Select+All&industry+section=Select+All&nco+division=Select+All&employee+contract=Select+All&enterprise+size=Select+All&enterprise+type=Select+All&isSemantic=1)
+
+### Case 2: User specific data mention kare (state, year, series, back series, etc.)
+
+- **100% accurate** filter values fill karo
+- State bola → exact state
+- Year bola → exact year
+- Series/Back series bola → Series + Base_Year sahi combo (Current↔2012, Back↔2010)
+- Jo bhi filter/essential user ne maanga, woh exactly mile
+
+**Reminder:** Golden rule follow karte hue — narrow scope only.
+
+## Code Structure
+
+- `MANDATORY_4`, `ESSENTIAL_FILTERS_BY_DATASET` — constants in running_code.py
+- `ensure_required_filters_present()` — adds missing 4 + essential, then order
+- `ensure_cpi_series_base_year_consistent()` — CPI/CPI2 only, no other dataset

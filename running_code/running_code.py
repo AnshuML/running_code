@@ -1602,8 +1602,7 @@ def ensure_required_filters_present(best_filters, parent_code, grouped, query, c
 
 
 def ensure_cpi_series_base_year_consistent(best_filters, parent_code, grouped, query):
-    """CPI ke liye Series+Base_Year valid combo ensure karo (Current↔2012, Back↔2010 unless user explicitly says otherwise)."""
-    # Golden rule: narrow scope only
+    """CPI ke liye Series+Base_Year valid combo ensure karo (Current↔2012, Back↔2010 unless user explicitly says otherwise). Golden rule: narrow scope only."""
     if parent_code != "CPI":
         return best_filters
     by_name = {f["filter_name"]: f for f in best_filters}
