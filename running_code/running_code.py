@@ -1201,17 +1201,21 @@ except Exception:
 # ================================
 from langchain_ollama import ChatOllama
 
+rewriter_llm = None
 try:
     rewriter_llm = ChatOllama(
         model="llama3:70b",
         base_url="http://localhost:11434",
         temperature=0.3
     )
-
-    rewriter_llm.invoke("ping")
+    # Non-blocking ping with 10s timeout to avoid import hang when Ollama is down
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+    with ThreadPoolExecutor(max_workers=1) as _ex:
+        _f = _ex.submit(rewriter_llm.invoke, "ping")
+        _f.result(timeout=10)
     print(" Ollama is running")
-
 except Exception as e:
+    rewriter_llm = None
     print(" Ollama is not running")
 
 
@@ -1244,7 +1248,7 @@ def normalize_confidence(scores, min_conf=50, max_conf=95):
 BASE_YEAR_PATTERN = re.compile(r"(20\d{2})")
 
 def detect_base_year(query):
-    """Query mein base year (20xx) detect karo. CPI/CPI2 conflict resolve ke liye use hota hai."""
+    """Query mein base year (20xx) detect karo. CPI Series/Base_Year hint ke liye use hota hai."""
     q = query.lower()
 
     if "base year" or " base" in q:
@@ -1256,39 +1260,23 @@ def detect_base_year(query):
 
 
 def resolve_cpi_conflict(results, query):
-    """Jab CPI aur CPI2 dono top results mein hon: base year 2024+ → CPI2 rakho, else CPI rakho. Default: CPI2."""
-    # Only when CPI and CPI2 both present in top results
-    datasets = [r["parent"] for r in results]
-
-    if "CPI" not in datasets or "CPI2" not in datasets:
-        return results  # kuch mat chhedo
-
-    base_year = detect_base_year(query)
-
-    # ---------- case 1: user ne base year bola ----------
-    if base_year:
-        if base_year >= 2024:
-            # CPI2 rakho
-            return [r for r in results if r["parent"] != "CPI"]
-        else:
-            # CPI rakho
-            return [r for r in results if r["parent"] != "CPI2"]
-
-    # ---------- case 2: base year nahi bola ----------
-    return [r for r in results if r["parent"] != "CPI"]
+    """CPI2 removed; sirf CPI hai. No conflict resolution needed — return as-is."""
+    return results
 
 
 # ================================
-# CPI INDICATOR KEYWORD MAPPING (golden rule: CPI/CPI2 only)
+# CPI INDICATOR KEYWORD MAPPING (golden rule: CPI only)
 # ================================
 # Query phrases -> preferred indicator name substring (in name or desc)
 _CPI_QUERY_TO_INDICATOR = [
     ("general inflation", "General Index"),
     ("general index", "General Index"),
     ("combined inflation", "General Index"),
+    ("combined general inflation", "General Index"),
     ("combined general", "General Index"),
     ("headline inflation", "General Index"),
     ("all india inflation", "General Index"),
+    ("retail inflation", "General Index"),
     ("housing", "Group"),
     ("urban index", "Group"),
     ("rural index", "Group"),
@@ -1308,8 +1296,8 @@ _CPI_QUERY_TO_INDICATOR = [
 
 def _choose_best_cpi_indicator(pool, query):
     """
-    CPI/CPI2 candidates mein se query ke hisaab se best indicator choose karo.
-    Golden rule: sirf CPI/CPI2 ke liye; baaki datasets pe no-op (caller only passes CPI/CPI2 pool).
+    CPI candidates mein se query ke hisaab se best indicator choose karo.
+    Golden rule: sirf CPI ke liye; baaki datasets pe no-op (caller only passes CPI pool).
     """
     if not pool:
         return None
@@ -1333,31 +1321,39 @@ def _choose_best_cpi_indicator(pool, query):
 
 def _reorder_final_by_cpi_cpialrl_wpi_intent(final, query):
     """
-    Jab final list mein CPI/CPI2/CPIALRL/WPI ho, query intent ke hisaab se order fix karo:
-    wholesale/wpi -> WPI first; agricultural labour/cpialrl -> CPIALRL first; retail/inflation/cpi -> CPI/CPI2 first.
+    Jab final list mein CPI/CPIALRL/WPI ho, query intent ke hisaab se order fix karo:
+    wholesale/wpi -> WPI first; agricultural labour/cpialrl -> CPIALRL first; retail/inflation/cpi -> CPI first.
     Golden rule: sirf order change; koi dataset add/remove nahi.
     """
     if not final:
         return final
     parents = [r.get("parent") for r in final]
-    if not any(p in ("CPI", "CPI2", "CPIALRL", "WPI") for p in parents):
+    if not any(p in ("CPI", "CPIALRL", "WPI") for p in parents):
         return final
     q = (query or "").lower()
+    has_wpi_intent = ("wholesale" in q) or bool(re.search(r"\bwpi\b", q)) or ("factory price" in q)
+    has_cpialrl_intent = ("cpialrl" in q) or ("agricultural labour" in q) or ("rural labour" in q) or ("agri labour" in q)
+    # 'agricultural' word alone can be noisy; treat as CPIALRL only if labour context isn't contradicted by CPI words
+    has_cpialrl_intent = has_cpialrl_intent or ("agricultural" in q and ("labour" in q or "labor" in q))
+    has_cpi_intent = ("inflation" in q) or bool(re.search(r"\bcpi\b", q)) or ("consumer price" in q) or ("price index" in q) or ("general" in q) or ("combined" in q) or ("all india" in q and ("inflation" in q or "index" in q)) or ("back series" in q)
+    has_back_base_intent = ("back series" in q) or ("historical" in q) or bool(re.search(r"\bbase\s*year\s*2010\b", q)) or ("2010 base" in q)
 
     def _intent_priority(r):
         p = r.get("parent")
         if p == "WPI":
-            return 0 if ("wholesale" in q or "wpi" in q or "factory price" in q) else 2
+            # If user asked for back series / base year 2010, prefer CPI over WPI
+            if has_back_base_intent and has_cpi_intent and not has_wpi_intent:
+                return 2
+            return 0 if has_wpi_intent else 2
         if p == "CPIALRL":
-            return 0 if (
-                "agricultural" in q or "rural labour" in q or "cpialrl" in q
-                or "agricultural labour" in q or "agri labour" in q
-            ) else 2
-        if p in ("CPI", "CPI2"):
-            return 0 if (
-                "inflation" in q or "retail" in q or "consumer price" in q
-                or "general" in q or "cpi" in q or "price index" in q
-            ) and "wholesale" not in q else 1
+            # CPIALRL only when labour intent is explicit; avoid stealing generic CPI inflation queries
+            if has_cpialrl_intent and not ("general" in q or "combined" in q or "all india" in q):
+                return 0
+            return 2
+        if p == "CPI":
+            if has_wpi_intent:
+                return 1
+            return 0 if has_cpi_intent else 1
         return 2
 
     def _score_val(r):
@@ -1421,7 +1417,7 @@ ALLOWED OPERATIONS:
 
 CRITICAL RULE (VERY IMPORTANT):
 - If the user query is ONLY a dataset or product name
-  (examples: IIP, CPI, CPIALRL, HCES, ASI, NAS, PLFS, CPI2, EC, EC4, EC5, EC6, WPI),
+  (examples: IIP, CPI, CPIALRL, HCES, ASI, NAS, PLFS, EC, EC4, EC5, EC6, WPI),
   then: "EC" → "EC Economic Census" (matches EC4/EC5/EC6); "WPI" → "WPI Wholesale Price Index"; others RETURN AS IS.
 - Dataset names must NEVER be replaced with normal English words.
 
@@ -1469,11 +1465,13 @@ RAW: "factory output in mumbai"
 User Query:
 "{user_query}"
 """
+    if rewriter_llm is None:
+        return user_query
     try:
         out = rewriter_llm.invoke(prompt).content.strip()
         out = out.replace('"', '').replace("\n", " ").strip()
         return out
-    except:
+    except Exception:
         return user_query
 
 # ================================
@@ -1514,8 +1512,9 @@ ESSENTIAL_FILTERS_BY_DATASET = {
     "CPI": ["Series", "Base_Year"],
     "IIP": ["Base_Year"],
     "ASI": ["classification_year"],
-    "NAS": ["Series", "Frequency"],
+    "NAS": ["Series", "Frequency", "Base_Year"],
     "CPIALRL": ["Base_Year"],
+    "PLFS": ["Frequency"],
 }
 
 
@@ -1566,7 +1565,12 @@ def ensure_required_filters_present(best_filters, parent_code, grouped, query, c
     )
     # endregion agent log
     required = list(MANDATORY_4)
-    required.extend(ESSENTIAL_FILTERS_BY_DATASET.get(parent_code, []))
+    essential = list(ESSENTIAL_FILTERS_BY_DATASET.get(parent_code, []))
+    # IIP, NAS: Base_Year only when query explicitly mentions it (narrow scope)
+    if parent_code in ("IIP", "NAS") and "Base_Year" in essential:
+        if not (hints and hints.get("Base_Year")):
+            essential = [e for e in essential if e != "Base_Year"]
+    required.extend(essential)
     required = list(dict.fromkeys(required))
     out_names = {f["filter_name"]: f for f in best_filters}
     added = []
@@ -1583,7 +1587,7 @@ def ensure_required_filters_present(best_filters, parent_code, grouped, query, c
         out_names[r] = best_filters[-1]
         added.append(r)
     best_filters = ensure_mandatory_filter_order(best_filters, parent_code)
-    # Golden rule: CPI-only (do not affect CPI2 / other datasets)
+    # Golden rule: CPI-only; other datasets unaffected
     best_filters = ensure_cpi_series_base_year_consistent(best_filters, parent_code, grouped, query)
     # region agent log
     _agent_log(
@@ -1633,6 +1637,8 @@ def ensure_cpi_series_base_year_consistent(best_filters, parent_code, grouped, q
     # If query explicitly mentions base year 2010/2012, respect it; otherwise apply default linkage.
     if re.search(r"\bbase\s*year\s*2010\b", q_lower) or re.search(r"\b2010\s*base\b", q_lower):
         target_series, target_base = "Back", "2010"
+    elif (re.search(r"\bbase\s*year\s*2012\b", q_lower) or re.search(r"\b2012\s*base\b", q_lower) or "base 2012" in q_lower) and ("back" in q_lower or "back series" in q_lower):
+        target_series, target_base = "Back", "2012"
     elif re.search(r"\bbase\s*year\s*2012\b", q_lower) or re.search(r"\b2012\s*base\b", q_lower):
         target_series, target_base = "Current", "2012"
     elif "back" in q_lower or "back series" in q_lower or "historical" in q_lower:
@@ -1962,6 +1968,35 @@ def select_best_filter_option(query, filter_name, options, cross_encoder, hints:
         }
 
     # =========================
+    # SECTOR FILTER (CPI etc.)
+    # =========================
+    if fname_lower == "sector":
+        if isinstance(hint_value, str) and hint_value.strip():
+            hv = hint_value.strip().lower()
+            for opt in options:
+                if str(opt.get("option", "")).strip().lower() == hv:
+                    return opt
+        for kw in ("combined", "urban", "rural"):
+            if kw in q_lower:
+                for opt in options:
+                    if str(opt.get("option", "")).strip().lower() == kw:
+                        return opt
+
+    # =========================
+    # STATE FILTER (All India + hint match)
+    # =========================
+    if fname_lower == "state":
+        if isinstance(hint_value, str) and hint_value.strip():
+            hv = hint_value.strip().lower()
+            for opt in options:
+                if str(opt.get("option", "")).strip().lower() == hv:
+                    return opt
+        if "all india" in q_lower or "all-india" in q_lower:
+            for opt in options:
+                if "all india" in str(opt.get("option", "")).lower():
+                    return opt
+
+    # =========================
     # OTHER FILTERS
     # =========================
     mentioned = []
@@ -2043,6 +2078,8 @@ ENABLE_VECTOR_INIT = False  # vector init hangs; keep BM25+rerank serving
 # VECTOR DB
 # ================================
 COLLECTION = "indicators_collection"
+# mxbai-embed-large-v1 dimension; used when creating Qdrant collection before bi_encoder loads
+VECTOR_DIM = 1024
 
 qclient = None
 faiss_index = None
@@ -2054,7 +2091,7 @@ if USE_QDRANT:
         if COLLECTION not in [c.name for c in qclient.get_collections().collections]:
             qclient.recreate_collection(
                 collection_name=COLLECTION,
-                vectors_config=qmodels.VectorParams(size=VECTOR_DIM,distance=qmodels.Distance.COSINE)
+                vectors_config=qmodels.VectorParams(size=VECTOR_DIM, distance=qmodels.Distance.COSINE)
             )
         print("[INFO] Qdrant ready")
     except Exception as e:
@@ -2363,15 +2400,13 @@ def search_indicators(query, top_k=25, max_products=3, use_hybrid=True):
 
     candidates = [INDICATORS[i] for i in fused_indices if 0 <= i < len(INDICATORS)]
 
-    # region agent log
-    _agent_log(
-        runId="pre-fix",
-        hypothesisId="D",
-        location="running_code.py:search_indicators:before_rerank",
-        message="About to rerank candidates",
-        data={"candidates_n": len(candidates)},
-    )
-    # endregion agent log
+    # Wait for reranker if not ready (avoids race: first request before background init completes)
+    import time as _time
+    _t0 = _time.time()
+    while cross_encoder is None and _time.time() - _t0 < 120 and _RERANK_ERROR is None:
+        _time.sleep(0.25)
+    if cross_encoder is None:
+        return []
     scores = cross_encoder.predict([(query, c["name"] + " " + c.get("desc", "")) for c in candidates])
     # region agent log
     _agent_log(
@@ -2393,8 +2428,8 @@ def search_indicators(query, top_k=25, max_products=3, use_hybrid=True):
     seen, final = set(), []
     for c in candidates:
         if c["parent"] not in seen:
-            # Golden rule: CPI/CPI2 ke liye indicator-level keyword match se best choose karo
-            if c["parent"] in ("CPI", "CPI2"):
+            # Golden rule: CPI ke liye indicator-level keyword match se best choose karo
+            if c["parent"] == "CPI":
                 pool = [x for x in candidates if x["parent"] == c["parent"]]
                 c = _choose_best_cpi_indicator(pool, query) or c
             seen.add(c["parent"])
@@ -2404,6 +2439,24 @@ def search_indicators(query, top_k=25, max_products=3, use_hybrid=True):
 
     # CPI vs CPIALRL vs WPI disambiguation: query intent ke hisaab se order fix (narrow scope)
     final = _reorder_final_by_cpi_cpialrl_wpi_intent(final, query)
+
+    # CPI force-include for clear CPI intent (harness parity + golden rule)
+    ql = (query or "").lower()
+    has_wpi_intent = ("wholesale" in ql) or bool(re.search(r"\bwpi\b", ql)) or ("factory price" in ql)
+    has_cpialrl_intent = ("cpialrl" in ql) or ("agricultural labour" in ql) or ("rural labour" in ql) or ("agri labour" in ql)
+    has_cpi_intent = (
+        ("inflation" in ql) or bool(re.search(r"\bcpi\b", ql)) or ("consumer price" in ql) or ("price index" in ql)
+        or ("retail" in ql and "price" in ql) or ("general" in ql and ("inflation" in ql or "index" in ql))
+        or ("combined" in ql and ("inflation" in ql or "index" in ql)) or ("back series" in ql)
+        or (("electricity" in ql or "housing" in ql or "mobile phone" in ql or "tuition" in ql) and ("price" in ql or "cost" in ql or "index" in ql))
+        or (("rice" in ql or "wheat" in ql or "mustard" in ql or "vegetable" in ql or "oil" in ql) and "price" in ql and "wholesale" not in ql)
+    )
+    if has_cpi_intent and (not has_wpi_intent) and (not has_cpialrl_intent):
+        if final and final[0].get("parent") != "CPI":
+            cpi_best = _search_dataset_only(query, ("CPI",))
+            if cpi_best:
+                final = [cpi_best] + [r for r in final if r.get("parent") != cpi_best.get("parent")]
+                final = final[:max_products]
 
     # region agent log
     _agent_log(
@@ -2439,6 +2492,238 @@ def _search_wpi_only(query):
 def _search_ec_only(query):
     """EC4/EC5/EC6 ke andar search karo. Economic Census force-include ke liye."""
     return _search_dataset_only(query, ("EC4", "EC5", "EC6"))
+
+
+def _cpi_intent_for_force_include(raw_lower: str) -> bool:
+    """CPI force-include / prioritize ke liye: inflation, retail price, back series, housing/electricity/mobile+price, etc. WPI/CPIALRL exclude."""
+    if "wholesale" in raw_lower or re.search(r"\bwpi\b", raw_lower) or "factory price" in raw_lower:
+        return False
+    if "cpialrl" in raw_lower or ("agricultural" in raw_lower and "labour" in raw_lower):
+        return False
+    return (
+        re.search(r"\bcpi\b", raw_lower)
+        or ("inflation" in raw_lower)
+        or ("consumer price" in raw_lower)
+        or ("retail" in raw_lower and "price" in raw_lower)
+        or ("general" in raw_lower and ("inflation" in raw_lower or "index" in raw_lower))
+        or ("combined" in raw_lower and ("inflation" in raw_lower or "index" in raw_lower))
+        or ("back series" in raw_lower)
+        or ("all india" in raw_lower and ("inflation" in raw_lower or "index" in raw_lower))
+        or (("electricity" in raw_lower or "housing" in raw_lower or "mobile phone" in raw_lower or "tuition" in raw_lower) and ("price" in raw_lower or "cost" in raw_lower or "index" in raw_lower))
+        or (("rice" in raw_lower or "wheat" in raw_lower or "mustard" in raw_lower or "vegetable" in raw_lower) and "price" in raw_lower)
+        or (("gold" in raw_lower or "petrol" in raw_lower or "lpg" in raw_lower or "bicycle" in raw_lower) and ("price" in raw_lower or "cost" in raw_lower or "index" in raw_lower))
+    )
+
+
+def get_top_results_for_query(raw_q: str, *, max_products: int = 3, return_rewritten: bool = False):
+    """
+    Production parity helper.
+    Given a raw user query, apply the same rewrite + force-include + prioritize rules as `predict()`,
+    and return the finalized top results (list of INDICATORS dicts with `score`).
+    If return_rewritten=True, returns (results, rewritten_query).
+    """
+    raw_q = (raw_q or "").strip()
+    if not raw_q:
+        return ([], None) if return_rewritten else []
+
+    q = rewrite_query_with_llm(raw_q)
+
+    # Fallback: expand dataset short names for better semantic search (same as predict)
+    q_lower = (q or "").lower()
+    if re.search(r"\bec\b", q_lower) and not any(x in q_lower for x in ["economic census", "ec4", "ec5", "ec6"]):
+        q = (q or "") + " Economic Census"
+    if re.search(r"\bwpi\b", q_lower) and not any(x in q_lower for x in ["wholesale price", "wholesale price index"]):
+        q = (q or "") + " Wholesale Price Index"
+    if re.search(r"\baishe\b", q_lower) and "higher education" not in q_lower:
+        q = (q or "") + " All India Survey on Higher Education"
+    if re.search(r"\bnfhs\b", q_lower) and "family health" not in q_lower:
+        q = (q or "") + " National Family Health Survey"
+    if re.search(r"\bnss", q_lower) and "national sample" not in q_lower:
+        q = (q or "") + " National Sample Survey"
+    # CPIALRL: agricultural/rural labour in query
+    if ("agricultural" in q_lower and ("labour" in q_lower or "labor" in q_lower)) or "rural labour" in q_lower or "cpialrl" in q_lower:
+        if "cpialrl" not in q_lower:
+            q = (q or "") + " CPIALRL Consumer Price Index Agricultural Labour"
+    # IIP: index of industrial production
+    if re.search(r"\biip\b", q_lower) or "index of industrial production" in q_lower or "industrial production" in q_lower:
+        if "iip" not in q_lower and "index of industrial production" not in q_lower:
+            q = (q or "") + " IIP Index of Industrial Production"
+    # PLFS: labour force, LFPR, unemployment, worker population
+    if "lfpr" in q_lower or "labour force participation" in q_lower or "worker population ratio" in q_lower or "periodic labour force" in q_lower:
+        if "plfs" not in q_lower:
+            q = (q or "") + " PLFS Periodic Labour Force Survey"
+
+    top_results = search_indicators(q, max_products=max_products)
+    if not top_results:
+        return ([], q) if return_rewritten else []
+
+    # Force-include EC (same as predict)
+    _raw_lower = raw_q.lower()
+    _ec_like = ("economic" in _raw_lower and "census" in _raw_lower) or bool(re.search(r"\bec\b", _raw_lower))
+    ec_wanted = _ec_like and not any(x in _raw_lower for x in ["ec4", "ec5", "ec6"])
+    ec_in_results = any(r.get("parent") in ("EC4", "EC5", "EC6") for r in top_results)
+    if ec_wanted and not ec_in_results:
+        ec_best = _search_ec_only(q or raw_q)
+        if ec_best:
+            top_results = [ec_best] + [r for r in top_results if r.get("parent") != ec_best.get("parent")][: max_products - 1]
+            ec_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Force-include WPI (same as predict)
+    _wpi_like = re.search(r"\bwpi\b", _raw_lower) or ("wholesale" in _raw_lower and "price" in _raw_lower)
+    wpi_wanted = bool(_wpi_like)
+    wpi_in_results = any(r.get("parent") == "WPI" for r in top_results)
+    if wpi_wanted and not wpi_in_results:
+        wpi_best = _search_wpi_only(q or raw_q)
+        if wpi_best:
+            top_results = [wpi_best] + [r for r in top_results if r.get("parent") != wpi_best.get("parent")][: max_products - 1]
+            wpi_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Force-include CPI when strong CPI intent but CPI not in results (inflation, back series, housing, electricity, etc.)
+    if _cpi_intent_for_force_include(_raw_lower) and not any(r.get("parent") == "CPI" for r in top_results):
+        cpi_best = _search_dataset_only(q or raw_q, ("CPI",))
+        if cpi_best:
+            top_results = [cpi_best] + [r for r in top_results if r.get("parent") != "CPI"][: max_products - 1]
+            cpi_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Force-include CPIALRL when agricultural labour / rural labour intent
+    _cpialrl_intent = (
+        re.search(r"\bcpialrl\b", _raw_lower)
+        or ("agricultural" in _raw_lower and ("labour" in _raw_lower or "labor" in _raw_lower))
+        or "rural labour" in _raw_lower
+        or "agri labour" in _raw_lower
+    )
+    if _cpialrl_intent and not any(r.get("parent") == "CPIALRL" for r in top_results):
+        cpialrl_best = _search_dataset_only(q or raw_q, ("CPIALRL",))
+        if cpialrl_best:
+            top_results = [cpialrl_best] + [r for r in top_results if r.get("parent") != "CPIALRL"][: max_products - 1]
+            cpialrl_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Force-include IIP when industrial production intent
+    _iip_intent = (
+        re.search(r"\biip\b", _raw_lower)
+        or "index of industrial production" in _raw_lower
+        or "industrial production" in _raw_lower
+    )
+    if _iip_intent and not any(r.get("parent") == "IIP" for r in top_results):
+        iip_best = _search_dataset_only(q or raw_q, ("IIP",))
+        if iip_best:
+            top_results = [iip_best] + [r for r in top_results if r.get("parent") != "IIP"][: max_products - 1]
+            iip_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Force-include by dataset-name intent (same as predict, CPI included)
+    _force_ds = None
+    if re.search(r"\bnss77\b", _raw_lower):
+        _force_ds = ["NSS77"]
+    elif re.search(r"\bnss78\b", _raw_lower):
+        _force_ds = ["NSS78"]
+    elif re.search(r"\bnss79c\b", _raw_lower):
+        _force_ds = ["NSS79C"]
+    elif re.search(r"\bnss79\b", _raw_lower):
+        _force_ds = ["NSS79"]
+    elif re.search(r"\bnss\b", _raw_lower):
+        _force_ds = ["NSS77", "NSS78", "NSS79", "NSS79C"]
+    elif re.search(r"\bnfhs\b", _raw_lower):
+        _force_ds = ["NFHS"]
+    elif re.search(r"\baishe\b", _raw_lower):
+        _force_ds = ["AISHE"]
+    elif re.search(r"\bcpialrl\b", _raw_lower) or ("agricultural" in _raw_lower and ("labour" in _raw_lower or "labor" in _raw_lower)) or "rural labour" in _raw_lower:
+        _force_ds = ["CPIALRL"]
+    elif re.search(r"\biip\b", _raw_lower) or "index of industrial production" in _raw_lower or "industrial production" in _raw_lower:
+        _force_ds = ["IIP"]
+    elif "lfpr" in _raw_lower or "labour force participation" in _raw_lower or "worker population ratio" in _raw_lower or "periodic labour force" in _raw_lower:
+        _force_ds = ["PLFS"]
+    elif _cpi_intent_for_force_include(_raw_lower):
+        _force_ds = ["CPI"]
+    elif re.search(r"\bplfs\b", _raw_lower):
+        _force_ds = ["PLFS"]
+    elif re.search(r"\bec\b", _raw_lower) or ("economic" in _raw_lower and "census" in _raw_lower):
+        _force_ds = ["EC4", "EC5", "EC6"]
+    if _force_ds and not any(r.get("parent") in _force_ds for r in top_results):
+        ds_best = _search_dataset_only(q or raw_q, _force_ds)
+        if ds_best:
+            top_results = [ds_best] + [r for r in top_results if r.get("parent") != ds_best.get("parent")][: max_products - 1]
+            ds_best["score"] = max(float(r.get("score") or 0) for r in top_results) + 1
+
+    # Prioritize dataset to 1st (same as predict, CPI included)
+    _ds_priority = None
+    if re.search(r"\bnss77\b", _raw_lower):
+        _ds_priority = ["NSS77"]
+    elif re.search(r"\bnss78\b", _raw_lower):
+        _ds_priority = ["NSS78"]
+    elif re.search(r"\bnss79c\b", _raw_lower):
+        _ds_priority = ["NSS79C"]
+    elif re.search(r"\bnss79\b", _raw_lower):
+        _ds_priority = ["NSS79"]
+    elif re.search(r"\bec4\b", _raw_lower):
+        _ds_priority = ["EC4"]
+    elif re.search(r"\bec5\b", _raw_lower):
+        _ds_priority = ["EC5"]
+    elif re.search(r"\bec6\b", _raw_lower):
+        _ds_priority = ["EC6"]
+    elif re.search(r"\bwpi\b", _raw_lower) or ("wholesale" in _raw_lower and "price" in _raw_lower):
+        _ds_priority = ["WPI"]
+    elif re.search(r"\biip\b", _raw_lower) or "index of industrial production" in _raw_lower or "industrial production" in _raw_lower:
+        _ds_priority = ["IIP"]
+    elif re.search(r"\bplfs\b", _raw_lower):
+        _ds_priority = ["PLFS"]
+    elif re.search(r"\bec\b", _raw_lower) or ("economic" in _raw_lower and "census" in _raw_lower):
+        _ds_priority = ["EC4", "EC5", "EC6"]
+    elif re.search(r"\bnss\b", _raw_lower):
+        _ds_priority = ["NSS77", "NSS78", "NSS79", "NSS79C"]
+    elif _cpi_intent_for_force_include(_raw_lower):
+        _ds_priority = ["CPI"]
+    elif re.search(r"\bcpialrl\b", _raw_lower) or ("consumer price" in _raw_lower and "agricultural" in _raw_lower):
+        _ds_priority = ["CPIALRL"]
+
+    if _ds_priority:
+        for i, r in enumerate(top_results):
+            if r.get("parent") in _ds_priority:
+                if i > 0:
+                    top_results = [r] + [x for x in top_results if x.get("parent") != r.get("parent")][: max_products - 1]
+                all_scores = [float(x.get("score") or 0) for x in top_results]
+                top_results[0]["score"] = max(all_scores) + 1
+                break
+
+    out = top_results[:max_products]
+    return (out, q) if return_rewritten else out
+
+
+def get_full_results_with_filters(raw_q: str, *, max_products: int = 3, return_rewritten: bool = False):
+    """
+    Returns full results with filters (same structure as predict) for accuracy testing.
+    Uses get_top_results_for_query internally; computes filters via same pipeline as predict.
+    """
+    raw_q = (raw_q or "").strip()
+    if not raw_q:
+        return ([], None) if return_rewritten else []
+    top_results, q = get_top_results_for_query(raw_q, max_products=max_products, return_rewritten=True)
+    if not top_results:
+        return ([], q) if return_rewritten else []
+    confidences = [min(95, max(50, float(r.get("score", 0)) * 20)) for r in top_results]
+    results = []
+    for ind, conf in zip(top_results, confidences):
+        dataset = next((d for d in DATASETS if d["code"] == ind.get("parent")), {"code": ind.get("parent"), "name": ind.get("parent")})
+        related_filters = [f for f in FILTERS if f["parent"] == ind.get("code")]
+        grouped = {}
+        for f in related_filters:
+            grouped.setdefault(f["filter_name"], []).append(f)
+        hints = compute_filter_hints(ind.get("parent", ""), raw_q, q)
+        best_filters = []
+        for fname, opts in grouped.items():
+            best_opt = select_best_filter_option(query=q, filter_name=fname, options=opts, cross_encoder=cross_encoder, hints=hints)
+            best_filters.append({"filter_name": fname, "option": best_opt["option"]})
+        best_filters = ensure_required_filters_present(best_filters, ind.get("parent", ""), grouped, q, cross_encoder, hints=hints)
+        results.append({
+            "dataset": dataset.get("name", ind.get("parent")),
+            "product": (dataset.get("code") or ind.get("parent") or "").lower(),
+            "indicator": ind.get("name", ""),
+            "parent": ind.get("parent"),
+            "confidence": conf,
+            "filters": best_filters,
+        })
+    if return_rewritten:
+        return results, q
+    return results
 
 
 ###################query capture 
@@ -2478,39 +2763,58 @@ def compute_filter_hints(parent_code: str, raw_query: str, rewritten_query: str 
     """
     text = f"{raw_query or ''} {(rewritten_query or '')}".lower()
     hints: dict[str, str | int] = {}
+    month_names = ("january","february","march","april","may","june","july","august","september","october","november","december")
 
     # -----------------------------
-    # CPI / CPI2  (Base_Year + Series where applicable)
+    # CPI (Base_Year + Series)
     # -----------------------------
     if parent_code == "CPI":
         # CPI has Base_Year: 2012/2010 and Series: Current/Back
-        if "base year 2010" in text or "2010 base year" in text or re.search(r"\bbase\s*year\s*2010\b", text):
+        # Explicit base year + series combos (every permutation)
+        if "base year 2010" in text or "2010 base year" in text or re.search(r"\bbase\s*year\s*2010\b", text) or re.search(r"\b2010\s*base\b", text):
             hints["Base_Year"] = "2010"
             hints["Series"] = "Back"
-        elif "base year 2012" in text or "2012 base year" in text or re.search(r"\bbase\s*year\s*2012\b", text):
+        elif "base year 2012" in text or "2012 base year" in text or re.search(r"\bbase\s*year\s*2012\b", text) or re.search(r"\b2012\s*base\b", text) or ("back series" in text and "base 2012" in text):
             hints["Base_Year"] = "2012"
-            hints["Series"] = "Current"
+            # "Back series (Base 2012)" -> Back+2012; "Base 2012" alone -> Current+2012
+            hints["Series"] = "Back" if ("back" in text or "back series" in text) else "Current"
         elif "back series" in text or "back data" in text or "old series" in text or "historical" in text:
-            # CPI back series defaults to 2010 base unless explicit says otherwise
             hints["Series"] = "Back"
             hints["Base_Year"] = "2010"
         elif "current series" in text or "latest series" in text or "new series" in text:
             hints["Series"] = "Current"
             hints["Base_Year"] = "2012"
 
-    if parent_code == "CPI2":
-        # CPI2 has Base_Year: 2024 and no Series filter in products.json
-        hints["Base_Year"] = "2024"
-        # If user explicitly wants combined/rural/urban, keep as hint for Sector (exact option labels exist)
+        # Sector + State hints
         if "combined" in text:
             hints["Sector"] = "Combined"
         elif "urban" in text:
             hints["Sector"] = "Urban"
         elif "rural" in text:
             hints["Sector"] = "Rural"
+        if "all india" in text or "all-india" in text:
+            hints["State"] = "All India"
+
+        # Year: prefer year from "Month YYYY" (e.g. "July 2024", "for September 2025") - data year, not base year
+        month_year = re.search(r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+(20\d{2})\b", text)
+        if month_year:
+            hints["Year"] = int(month_year.group(1))
+        elif any(m in text for m in month_names):
+            all_years = [int(m.group(1)) for m in re.finditer(r"\b(20\d{2})\b", text)]
+            # Prefer data years 2011-2025; exclude 2010/2012 if they're base year context
+            data_years = [y for y in all_years if 2011 <= y <= 2025 and (y not in (2010, 2012) or "base" not in text)]
+            if data_years:
+                hints["Year"] = data_years[0]
+            elif all_years:
+                hints["Year"] = all_years[0]
+
+        # Year 2024/2025 + no explicit base mentioned -> Current + 2012 (CPI single dataset)
+        if hints.get("Year") in (2024, 2025) and "Base_Year" not in hints and "base" not in text:
+            hints["Series"] = hints.get("Series", "Current")
+            hints["Base_Year"] = "2012"
 
     # -----------------------------
-    # NAS (Series + Frequency)
+    # NAS (Series + Frequency + Base_Year when explicitly mentioned)
     # -----------------------------
     if parent_code == "NAS":
         if "constant price" in text or "constant prices" in text:
@@ -2525,6 +2829,11 @@ def compute_filter_hints(parent_code: str, raw_query: str, rewritten_query: str 
         elif "annual" in text or "annually" in text:
             hints["Frequency"] = "Annual"
 
+        # Base_Year only when explicitly mentioned (e.g. "base year 2020-21", "base 2011-12")
+        m = re.search(r"(20\d{2}[-/]\d{2,4})", text)
+        if m and "base" in text:
+            hints["Base_Year"] = m.group(1)
+
     # -----------------------------
     # IIP (Base_Year / Financial_year)
     # -----------------------------
@@ -2535,20 +2844,32 @@ def compute_filter_hints(parent_code: str, raw_query: str, rewritten_query: str 
             hints["Financial_year"] = m.group(1)
 
     # -----------------------------
-    # ASI (classification_year)
+    # ASI (classification_year - NIC 1987/1998/2004/2008)
     # -----------------------------
     if parent_code == "ASI":
-        m = YEAR_PATTERN.search(text)
-        if m:
-            hints["classification_year"] = int(m.group(1))
+        # NIC 2008, NIC 2004, classification 2008, classification year 2008, ASI 2008 (when NIC context)
+        nic_match = re.search(r"\b(?:nic|classification(?:\s*year)?)\s*[:\s]*(\d{4})\b", text)
+        if nic_match:
+            hints["classification_year"] = int(nic_match.group(1))
+        else:
+            # Fallback: any 4-digit year near "classification" or standalone in ASI context
+            m = YEAR_PATTERN.search(text)
+            if m:
+                hints["classification_year"] = int(m.group(1))
 
     # -----------------------------
-    # PLFS (Year hint only; other filters already handled via synonym map)
+    # PLFS (Year + Frequency for essential filter)
     # -----------------------------
     if parent_code == "PLFS":
         m = YEAR_PATTERN.search(text)
         if m:
             hints["Year"] = int(m.group(1))
+        if "quarterly" in text or "q1" in text or "q2" in text or "q3" in text or "q4" in text:
+            hints["Frequency"] = "Quarterly"
+        elif "monthly" in text:
+            hints["Frequency"] = "Monthly"
+        elif "annual" in text or "annually" in text:
+            hints["Frequency"] = "Annual"
 
     # -----------------------------
     # ENVSTAT / TUS / Gender / HCES / ESI:
@@ -2700,25 +3021,36 @@ def predict():
             top_results = [wpi_best] + [r for r in top_results if r["parent"] != wpi_best["parent"]][:2]
             wpi_best["score"] = max(r["score"] for r in top_results) + 1  # 95% confidence
 
-    # Force-include when user searched by dataset name but it's not in results
+    # Force-include CPI when strong CPI intent but CPI not in results
     _raw_lower = raw_q.lower().strip()
+    if _cpi_intent_for_force_include(_raw_lower) and not any(r["parent"] == "CPI" for r in top_results):
+        cpi_best = _search_dataset_only(q or raw_q, ("CPI",))
+        if cpi_best:
+            top_results = [cpi_best] + [r for r in top_results if r["parent"] != "CPI"][:2]
+            cpi_best["score"] = max(r["score"] for r in top_results) + 1
+
+    # Force-include when user searched by dataset name but it's not in results
     _force_ds = None
     if re.search(r'\bnss77\b', _raw_lower):
         _force_ds = ["NSS77"]
     elif re.search(r'\bnss78\b', _raw_lower):
         _force_ds = ["NSS78"]
-    elif re.search(r'\bnss79\b', _raw_lower) or re.search(r'\bnss79c\b', _raw_lower):
+    elif re.search(r'\bnss79c\b', _raw_lower):
         _force_ds = ["NSS79C"]
+    elif re.search(r'\bnss79\b', _raw_lower):
+        _force_ds = ["NSS79"]
     elif re.search(r'\bnss\b', _raw_lower):
-        _force_ds = ["NSS77", "NSS78", "NSS79C"]
+        _force_ds = ["NSS77", "NSS78", "NSS79", "NSS79C"]
     elif re.search(r'\bnfhs\b', _raw_lower):
         _force_ds = ["NFHS"]
     elif re.search(r'\baishe\b', _raw_lower):
         _force_ds = ["AISHE"]
-    elif re.search(r'\bcpi\b', _raw_lower) or ("inflation" in _raw_lower and "wholesale" not in _raw_lower and "wpi" not in _raw_lower):
-        _force_ds = ["CPI", "CPI2"]
+    elif _cpi_intent_for_force_include(_raw_lower):
+        _force_ds = ["CPI"]
     elif re.search(r'\bplfs\b', _raw_lower):
         _force_ds = ["PLFS"]
+    elif re.search(r'\bec\b', _raw_lower) or ("economic" in _raw_lower and "census" in _raw_lower):
+        _force_ds = ["EC4", "EC5", "EC6"]
     if _force_ds and not any(r["parent"] in _force_ds for r in top_results):
         ds_best = _search_dataset_only(q or raw_q, _force_ds)
         if ds_best:
@@ -2733,16 +3065,16 @@ def predict():
         _ds_priority = ["NSS77"]
     elif re.search(r'\bnss78\b', _raw_lower):
         _ds_priority = ["NSS78"]
-    elif re.search(r'\bnss79\b', _raw_lower) or re.search(r'\bnss79c\b', _raw_lower):
+    elif re.search(r'\bnss79c\b', _raw_lower):
         _ds_priority = ["NSS79C"]
+    elif re.search(r'\bnss79\b', _raw_lower):
+        _ds_priority = ["NSS79"]
     elif re.search(r'\bec4\b', _raw_lower):
         _ds_priority = ["EC4"]
     elif re.search(r'\bec5\b', _raw_lower):
         _ds_priority = ["EC5"]
     elif re.search(r'\bec6\b', _raw_lower):
         _ds_priority = ["EC6"]
-    elif re.search(r'\bcpi2\b', _raw_lower):
-        _ds_priority = ["CPI2"]
     elif re.search(r'\bwpi\b', _raw_lower) or ("wholesale" in _raw_lower and "price" in _raw_lower):
         _ds_priority = ["WPI"]
     elif re.search(r'\bplfs\b', _raw_lower):
@@ -2750,9 +3082,9 @@ def predict():
     elif re.search(r'\bec\b', _raw_lower) or ("economic" in _raw_lower and "census" in _raw_lower):
         _ds_priority = ["EC4", "EC5", "EC6"]
     elif re.search(r'\bnss\b', _raw_lower):
-        _ds_priority = ["NSS77", "NSS78", "NSS79C"]
-    elif re.search(r'\bcpi\b', _raw_lower) or ("inflation" in _raw_lower and "wholesale" not in _raw_lower and "wpi" not in _raw_lower):
-        _ds_priority = ["CPI", "CPI2"]
+        _ds_priority = ["NSS77", "NSS78", "NSS79", "NSS79C"]
+    elif _cpi_intent_for_force_include(_raw_lower):
+        _ds_priority = ["CPI"]
     elif re.search(r'\bcpialrl\b', _raw_lower) or ("consumer price" in _raw_lower and "agricultural" in _raw_lower):
         _ds_priority = ["CPIALRL"]
     elif re.search(r'\bnas\b', _raw_lower):
@@ -2888,5 +3220,5 @@ def predict():
 
 if __name__ == "__main__":
     # Disable auto-reloader to avoid double initialization on cold start.
-    app.run(debug=True, host="0.0.0.0", port=5009, use_reloader=False)
+    app.run(debug=False, host="0.0.0.0", port=5009, use_reloader=False)
 
